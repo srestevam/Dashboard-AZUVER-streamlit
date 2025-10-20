@@ -9,7 +9,7 @@ st.set_page_config(page_title="Relações AZUVER — Dashboard Informacional", l
 
 # ======= Configurações =======
 BASELINE_DATE = pd.to_datetime("2025-10-16")  # Matriz Inicial fixa
-DEFAULT_XLSX = "AZUVER_dashboard_data.xlsx"   # Planilha Excel com abas: relations_daily, actors, events, event_impacts
+DEFAULT_XLSX = "AZUVER_dashboard_data_teste.xlsx"   # Planilha Excel com abas: relations_daily, actors, events, event_impacts
 
 # ======= Leitura de dados (Excel) =======
 @st.cache_data
