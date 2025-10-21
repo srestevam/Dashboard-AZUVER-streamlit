@@ -37,6 +37,7 @@ def metric_column(metric: str, label: str, partido: str, day_df: pd.DataFrame, b
 
     # Baseline
     bl = baseline_df[["nome", metric]].dropna().copy()
+    import streamlit as st
     bl = bl.sort_values("nome")
     bl.rename(columns={metric: "Valor"}, inplace=True)
     bl["Cor"] = base_light
@@ -172,85 +173,108 @@ if not k.empty:
 else:
     st.info("Sem dados para os filtros atuais.")
 
-# ======= Variação por ator — barras verticais (Δ vs Baseline) =======
-st.markdown("### Variação por ator — ΔR e ΔC vs Baseline")
+# ======= Variação por ator — barras verticais (Δ vs Dia anterior | seção isolada) =======
+st.markdown("### Variação por ator — ΔR e ΔC vs Dia anterior")
 
-# Merge do dia com a baseline (já filtrados por partido_opt)
-cmp_df = day_df[["actor_id", "nome", "R", "C"]].merge(
-    baseline_df[["actor_id", "R", "C"]].rename(columns={"R": "R0", "C": "C0"}),
-    on="actor_id",
-    how="left"
-)
-
-# Cálculo dos deltas
-cmp_df["dR"] = cmp_df["R"] - cmp_df["R0"]
-cmp_df["dC"] = cmp_df["C"] - cmp_df["C0"]
-
-# Paletas (tons)
+# Paletas (tons) — NÃO ALTERAR
 POS_GREENS = ["#C8E6C9", "#A5D6A7", "#81C784", "#66BB6A", "#43A047", "#2E7D32"]
 NEG_ORANGES = ["#FFE0B2", "#FFCC80", "#FFB74D", "#FFA726", "#FB8C00", "#EF6C00"]
 
-def shade(delta: float, pos_palette=POS_GREENS, neg_palette=NEG_ORANGES, cap: float = 30.0) -> str:
-    """
-    Retorna um tom de cor proporcional ao |delta|.
-    cap limita a intensidade (|delta| >= cap usa o tom mais intenso).
-    """
-    if pd.isna(delta) or delta == 0:
-        return "#BDBDBD"  # neutro, se precisar
-    idx = int(round(min(abs(delta), cap) / cap * (len(pos_palette) - 1)))
-    return (pos_palette if delta > 0 else neg_palette)[idx]
+# --------- Dataframes LOCAIS (isolados) ---------
+# Não reutiliza/edita day_df/baseline_df/outros; filtra tudo daqui p/ evitar efeitos colaterais
+_rel_all_local = relations.copy()
+_rel_all_local["data"] = pd.to_datetime(_rel_all_local["data"], errors="coerce")
 
-# DataFrames de plot
-plot_R = cmp_df[["nome", "dR"]].dropna().copy()
-plot_C = cmp_df[["nome", "dC"]].dropna().copy()
+# Datas locais
+_dates_sorted_local = sorted(d for d in _rel_all_local["data"].dropna().unique())
+try:
+    _idx_local = _dates_sorted_local.index(pd.to_datetime(date_sel))
+    _prev_date_local = _dates_sorted_local[_idx_local - 1] if _idx_local > 0 else None
+except ValueError:
+    _prev_date_local = None
 
-# Ordenação por magnitude (opcional; comente se preferir ordem alfabética)
-plot_R["abs"] = plot_R["dR"].abs()
-plot_C["abs"] = plot_C["dC"].abs()
-plot_R = plot_R.sort_values("abs", ascending=False).drop(columns="abs")
-plot_C = plot_C.sort_values("abs", ascending=False).drop(columns="abs")
+if _prev_date_local is None:
+    st.info("Não há data anterior para comparar.")
+else:
+    # Filtra por PARTIDO (local)
+    _rel_party_local = _rel_all_local[_rel_all_local["partido"] == partido_opt].copy()
 
-# Cores por barra
-colors_R = [shade(v) for v in plot_R["dR"]]
-colors_C = [shade(v) for v in plot_C["dC"]]
+    # Subconjuntos locais: atual e anterior
+    _today_local = _rel_party_local[_rel_party_local["data"] == pd.to_datetime(date_sel)][["actor_id","nome","R","C"]].copy()
+    _prev_local  = _rel_party_local[_rel_party_local["data"] == pd.to_datetime(_prev_date_local)][["actor_id","nome","R","C"]].copy()
+    if _prev_local.empty or _today_local.empty:
+        st.info("Sem dados suficientes no dia anterior ou no dia atual para calcular as variações.")
+    else:
+        # Merge por actor_id (nome do dia atual preferencial; se faltar, usa do dia anterior)
+        _cmp_local = _today_local.merge(
+            _prev_local.rename(columns={"R":"R_prev","C":"C_prev","nome":"nome_prev"}),
+            on="actor_id", how="left"
+        )
+        _cmp_local["nome"] = _cmp_local["nome"].fillna(_cmp_local["nome_prev"])
+        _cmp_local.drop(columns=["nome_prev"], inplace=True)
 
-colR, colC = st.columns(2)
+        # Deltas locais (sem tocar outros DFs)
+        _cmp_local["dR"] = pd.to_numeric(_cmp_local["R"], errors="coerce") - pd.to_numeric(_cmp_local["R_prev"], errors="coerce")
+        _cmp_local["dC"] = pd.to_numeric(_cmp_local["C"], errors="coerce") - pd.to_numeric(_cmp_local["C_prev"], errors="coerce")
 
-with colR:
-    fig_dR = px.bar(
-        plot_R,
-        x="nome",
-        y="dR",
-        title=f"ΔR por ator — {partido_opt} (Atual − Baseline {BASELINE_DATE.strftime('%d/%m/%Y')})",
-        text_auto=True
-    )
-    fig_dR.update_traces(marker_color=colors_R)
-    fig_dR.update_layout(
-        xaxis_title="Atores",
-        yaxis_title="ΔR (pontos)",
-        height=520,
-        margin=dict(l=10, r=10, t=60, b=80)  # b maior para rótulos no eixo X
-    )
-    fig_dR.add_hline(y=0, line_dash="dot", line_color="#9E9E9E")
-    st.plotly_chart(fig_dR, use_container_width=True)
+        # Função de tonalidade (local)
+        def _shade_local(delta: float, cap: float = 30.0) -> str:
+            if pd.isna(delta) or float(delta) == 0.0:
+                return "#BDBDBD"  # neutro
+            idx = int(round(min(abs(float(delta)), cap) / cap * (len(POS_GREENS) - 1)))
+            return (POS_GREENS if delta > 0 else NEG_ORANGES)[idx]
 
-with colC:
-    fig_dC = px.bar(
-        plot_C,
-        x="nome",
-        y="dC",
-        title=f"ΔC por ator — {partido_opt} (Atual − Baseline {BASELINE_DATE.strftime('%d/%m/%Y')})",
-        text_auto=True
-    )
-    fig_dC.update_traces(marker_color=colors_C)
-    fig_dC.update_layout(
-        xaxis_title="Atores",
-        yaxis_title="ΔC (pontos)",
-        height=520,
-        margin=dict(l=10, r=10, t=60, b=80)
-    )
-    fig_dC.add_hline(y=0, line_dash="dot", line_color="#9E9E9E")
-    st.plotly_chart(fig_dC, use_container_width=True)
+        # DataFrames de plot locais
+        _plot_R_local = _cmp_local[["nome","dR"]].dropna().copy()
+        _plot_C_local = _cmp_local[["nome","dC"]].dropna().copy()
+
+        # Ordenação por magnitude (local)
+        _plot_R_local["abs"] = _plot_R_local["dR"].abs()
+        _plot_C_local["abs"] = _plot_C_local["dC"].abs()
+        _plot_R_local = _plot_R_local.sort_values("abs", ascending=False).drop(columns="abs")
+        _plot_C_local = _plot_C_local.sort_values("abs", ascending=False).drop(columns="abs")
+
+        # Cores por barra (local, usando as paletas acima)
+        _colors_R_local = [_shade_local(v) for v in _plot_R_local["dR"]]
+        _colors_C_local = [_shade_local(v) for v in _plot_C_local["dC"]]
+
+        _colR_local, _colC_local = st.columns(2)
+
+        with _colR_local:
+            _fig_dR_local = px.bar(
+                _plot_R_local,
+                x="nome",
+                y="dR",
+                title=f"ΔR por ator — {partido_opt} (Atual − {pd.to_datetime(_prev_date_local).strftime('%d/%m/%Y')})",
+                text_auto=True
+            )
+            _fig_dR_local.update_traces(marker_color=_colors_R_local)
+            _fig_dR_local.update_layout(
+                xaxis_title="Atores",
+                yaxis_title="ΔR (pontos)",
+                height=520,
+                margin=dict(l=10, r=10, t=60, b=80)
+            )
+            _fig_dR_local.add_hline(y=0, line_dash="dot", line_color="#9E9E9E")
+            st.plotly_chart(_fig_dR_local, use_container_width=True)
+
+        with _colC_local:
+            _fig_dC_local = px.bar(
+                _plot_C_local,
+                x="nome",
+                y="dC",
+                title=f"ΔC por ator — {partido_opt} (Atual − {pd.to_datetime(_prev_date_local).strftime('%d/%m/%Y')})",
+                text_auto=True
+            )
+            _fig_dC_local.update_traces(marker_color=_colors_C_local)
+            _fig_dC_local.update_layout(
+                xaxis_title="Atores",
+                yaxis_title="ΔC (pontos)",
+                height=520,
+                margin=dict(l=10, r=10, t=60, b=80)
+            )
+            _fig_dC_local.add_hline(y=0, line_dash="dot", line_color="#9E9E9E")
+            st.plotly_chart(_fig_dC_local, use_container_width=True)
 
 
 
@@ -407,8 +431,9 @@ else:
 
 st.caption("Versão Excel • Barras horizontais por métrica (Baseline vs Dia, destaque laranja) • Linha de evolução por ator (R/C) • Matriz Inicial 16/10/2025.")
 
-# ======= Opinião Pública — Seção (duas colunas, 6 painéis) =======
+# ======= Opinião Pública — Seção (6 subseções com atores ponderados por geografia) =======
 import os
+import unicodedata
 import plotly.graph_objects as go
 
 st.markdown("## Opinião Pública a favor das operações do PARTIDO")
@@ -425,37 +450,29 @@ for i, (col, pth) in enumerate(zip(img_cols, IMG_PATHS), start=1):
         if isinstance(pth, str) and os.path.exists(pth):
             st.image(pth, caption=f"img{i}", use_container_width=True)
         else:
-            st.image(
-                "https://placehold.co/640x360?text=img" + str(i),
-                caption=f"img{i}",
-                use_container_width=True
-            )
+            st.image(f"https://placehold.co/640x360?text=img{i}", caption=f"img{i}", use_container_width=True)
 
-# --- Persistência por PARTIDO (garante que ajustes não contaminem o outro partido) ---
+# ---------- Persistência por PARTIDO (entradas independentes por partido) ----------
 if "op_inputs" not in st.session_state:
     st.session_state["op_inputs"] = {
-        "azul":      {"pesquisas": 50, "midia_base": 50, "fb": None, "manif": 50, "midia_val": 50},
-        "vermelho":  {"pesquisas": 50, "midia_base": 50, "fb": None, "manif": 50, "midia_val": 50},
+        "azul":     {"pesquisas": 50, "midia_base": 50, "fb": None, "manif": 50, "midia_val": 50},
+        "vermelho": {"pesquisas": 50, "midia_base": 50, "fb": None, "manif": 50, "midia_val": 50},
     }
 
 _party_key = partido_opt.lower()  # "azul" | "vermelho"
 _party_store = st.session_state["op_inputs"].get(_party_key, {"pesquisas": 50, "midia_base": 50, "fb": None, "manif": 50, "midia_val": 50})
 
-# chaves únicas por partido (widgets separados e estáveis por filtro)
 _key_pesq = f"pesquisas_{_party_key}"
 _key_fb   = f"fb_media_{_party_key}"
 _key_mid  = f"midia_sent_{_party_key}"
 _key_man  = f"manif_{_party_key}"
 
-# --- Entradas do dia (independentes por partido) ---
 with st.expander("Entradas do dia — compondo 60% do índice (Pesquisas 15%, Mídia/Redes 20%, Manifestações 25%)", expanded=True):
     c1, c2, c3 = st.columns(3)
     with c1:
         pesquisas_val = st.slider(
             "Pesquisas de Opinião Direta (0–100)",
-            min_value=0, max_value=100,
-            value=_party_store.get("pesquisas", 50),
-            step=1,
+            0, 100, _party_store.get("pesquisas", 50), 1,
             key=_key_pesq,
             help="Resultado agregado de pesquisas do dia (amostra simplificada)."
         )
@@ -469,7 +486,6 @@ with st.expander("Entradas do dia — compondo 60% do índice (Pesquisas 15%, M�
             key=_key_mid,
             help="Percepção consolidada do tom/volume (sentimento e cobertura)."
         )
-        # Ajuste leve pelo feedback (compatível com possíveis retornos 0/1 ou strings)
         is_pos = (fb_val == 1) or (fb_val == "positive")
         is_neg = (fb_val == 0) or (fb_val == "negative")
         adj = 5 if is_pos else (-5 if is_neg else 0)
@@ -477,14 +493,12 @@ with st.expander("Entradas do dia — compondo 60% do índice (Pesquisas 15%, M�
     with c3:
         manif_val = st.slider(
             "Manifestações Públicas (0–100)",
-            min_value=0, max_value=100,
-            value=_party_store.get("manif", 50),
-            step=1,
+            0, 100, _party_store.get("manif", 50), 1,
             key=_key_man,
             help="Sinal líquido de protestos/atos de apoio (tamanho, frequência, adesão)."
         )
 
-# Atualiza o armazenamento persistente do partido com os valores mais recentes
+# Atualiza e relê o armazenamento persistente do partido
 st.session_state["op_inputs"][_party_key] = {
     "pesquisas": st.session_state.get(_key_pesq, pesquisas_val),
     "midia_base": st.session_state.get(_key_mid, midia_base),
@@ -492,7 +506,6 @@ st.session_state["op_inputs"][_party_key] = {
     "manif": st.session_state.get(_key_man, manif_val),
     "midia_val": midia_val,
 }
-# Lê sempre a versão persistida (garantido após qualquer mudança de filtro)
 _party_store = st.session_state["op_inputs"][_party_key]
 pesquisas_val = _party_store["pesquisas"]
 midia_base    = _party_store["midia_base"]
@@ -500,50 +513,111 @@ fb_val        = _party_store["fb"]
 midia_val     = _party_store["midia_val"]
 manif_val     = _party_store["manif"]
 
-# --- Parâmetros fixos (fatores secundários definidos anteriormente) ---
+# ---------- Parâmetros fixos (fatores secundários por partido) ----------
 ECON_SOC = {"AZUL": 62, "VERMELHO": 43}
 HIST_CULT = {"AZUL": 68, "VERMELHO": 49}
-
 econ_val = ECON_SOC.get(partido_opt, 50)
 hist_val = HIST_CULT.get(partido_opt, 50)
 
-# --- Utilidades de cálculo ---
-def _rc_term(df: pd.DataFrame) -> float:
-    """Retorna Σ(R*C)/Σ(C) em 0–100; se Σ(C)==0, retorna média de R; se vazio, 50."""
-    if df is None or df.empty:
+# ---------- Especificação de atores por geografia (pesos devem somar 100) ----------
+REGION_SPECS = {
+    "INTERNACIONAL": [
+        ("CSOI (Conselho de Segurança)", 35),
+        ("AIEA (Ag. Int. de Energia Atômica)", 10),
+        ("ONGs (Internacionais)", 25),
+        ("GELO", 10),
+        ("CINZA", 5),
+        ("MARROM", 5),
+        ("ESCURO", 10),
+    ],
+    "CONTINENTE": [
+        ("CINZA", 50),
+        ("MARROM", 50),
+    ],
+    "PAÍS VERMELHO": [
+        ("SOWETO VERMELHO", 20),
+        ("População (VERMELHO)", 60),
+        ("APAV", 20),
+    ],
+    "PAÍS AZUL": [
+        ("PDC (Partido Democrático Cristão)", 30),
+        ("FILTO (Frente de Libertação de Topázio)", 10),
+        ("População (AZUL)", 60),
+    ],
+    "TOPÁZIO": [
+        ("FILTO (Frente de Libertação de Topázio)", 15),
+        ("MPL (Movimento Popular de Libertação)", 25),
+        ("Vermelhinos em TOPÁZIO", 20),
+        ("População (AZUL)", 15),
+        ("PDC (Partido Democrático Cristão)", 10),
+        ("PCS", 10),
+        ("Descendentes de Chumbo em TOPÁZIO", 5),
+    ],
+    "FENO": [
+        ("População (VERMELHO)", 50),
+        ("População (AZUL)", 50),
+    ],
+}
+
+# ---------- Utilidades de cálculo ----------
+def _normalize(txt: str) -> str:
+    if pd.isna(txt):
+        return ""
+    t = unicodedata.normalize("NFD", str(txt))
+    t = "".join([c for c in t if unicodedata.category(c) != "Mn"])
+    return t.upper().strip()
+
+def _actor_score_from_row(row: pd.Series) -> float:
+    """
+    Converte R/C (0–100) do ator em um escore único 0–100.
+    Escolha conservadora: produto normalizado (R*C)/100 mantém limites 0–100.
+    """
+    r = pd.to_numeric(row.get("R", np.nan), errors="coerce")
+    c = pd.to_numeric(row.get("C", np.nan), errors="coerce")
+    if pd.isna(r) or pd.isna(c):
+        return np.nan
+    return float((r * c) / 100.0)
+
+def _rc_weighted_named(df_day_party: pd.DataFrame, region_key: str) -> float:
+    """
+    Retorna escore 0–100 a partir de uma média ponderada (pesos em % na REGION_SPECS)
+    sobre atores específicos por geografia. Renormaliza pesos se atores faltarem.
+    Se nenhum ator for encontrado, faz fallback para Σ(R*C)/Σ(C).
+    """
+    spec = REGION_SPECS.get(region_key, [])
+    if df_day_party is None or df_day_party.empty or not spec:
         return 50.0
+
+    df = df_day_party[["actor_id", "nome", "R", "C"]].copy()
+    df["nome_norm"] = df["nome"].map(_normalize)
+
+    weighted_scores = []
+    weights_found = []
+
+    for label, w in spec:
+        target = _normalize(label)
+        # match por substring normalizada
+        hit = df[df["nome_norm"].str.contains(target, na=False)]
+        if hit.empty:
+            continue
+        # se houver múltiplos, usa média simples do escore desses matches
+        score_i = hit.apply(_actor_score_from_row, axis=1).mean(skipna=True)
+        if pd.notna(score_i):
+            weighted_scores.append(score_i * w)
+            weights_found.append(w)
+
+    if weights_found:
+        rcw = float(np.sum(weighted_scores) / np.sum(weights_found))
+        return float(np.clip(rcw, 0, 100))
+
+    # fallback — usa Σ(R*C)/Σ(C) com todos os atores do partido (no dia)
     R = pd.to_numeric(df["R"], errors="coerce")
-    C = pd.to_numeric(df["C"], errors="coerce")
-    Cpos = C.clip(lower=0)
-    denom = Cpos.sum()
+    C = pd.to_numeric(df["C"], errors="coerce").clip(lower=0)
+    denom = C.sum()
     if denom > 0:
-        return float((R * Cpos).sum() / denom)
+        return float(((R * C).sum() / denom))
     mR = R.mean(skipna=True)
     return float(mR) if pd.notna(mR) else 50.0
-
-def _filter_geo(df_all: pd.DataFrame, geo_name: str) -> pd.DataFrame:
-    """Filtra por geografia se a coluna existir; senão retorna df_all (fallback)."""
-    if df_all is None or df_all.empty:
-        return df_all
-    for col in ["geografia", "geo", "region", "regiao", "área", "area"]:
-        if col in df_all.columns:
-            series = df_all[col].astype(str).str.upper()
-            key = geo_name.upper()
-            synonyms = {
-                "PAÍS AZUL": ["PAIS AZUL", "PAÍS AZUL", "AZUL", "PAIS_AZUL"],
-                "PAÍS VERMELHO": ["PAIS VERMELHO", "PAÍS VERMELHO", "VERMELHO", "PAIS_VERMELHO"],
-                "CONTINENTE": ["CONTINENTE", "REGIONAL"],
-                "INTERNACIONAL": ["INTERNACIONAL", "GLOBAL", "MUNDIAL"],
-                "TOPÁZIO": ["TOPAZIO", "TOPÁZIO"],
-                "FENO": ["FENO"],
-            }
-            candidates = synonyms.get(key, [key])
-            mask = False
-            for cand in candidates:
-                mask = mask | series.eq(cand)
-            sub = df_all[mask]
-            return sub if not sub.empty else df_all
-    return df_all
 
 def _op_score(rc: float, pesquisas: float, midia: float, manif: float, econ: float, hist: float) -> float:
     """
@@ -552,17 +626,17 @@ def _op_score(rc: float, pesquisas: float, midia: float, manif: float, econ: flo
       0.25*RC + 0.10*Econ/Soc + 0.05*Hist/Cult
     """
     comp = (
-        0.15 * pesquisas +  # 15%
-        0.20 * midia +      # 20%
-        0.25 * manif +      # 25%
-        0.25 * rc +         # 25%
-        0.10 * econ +       # 10%
-        0.05 * hist         # 5%
+        0.15 * pesquisas +
+        0.20 * midia +
+        0.25 * manif +
+        0.25 * rc +
+        0.10 * econ +
+        0.05 * hist
     )
     return float(np.clip(comp, 0, 100))
 
 def _gauge(value: float, title: str, subtitle: str = "") -> go.Figure:
-    """Gauge 0–100 com faixas qualitativas e threshold no valor."""
+    """Gauge 0–100 com faixas qualitativas e threshold no valor (paleta inalterada)."""
     return go.Figure(
         go.Indicator(
             mode="gauge+number",
@@ -584,42 +658,56 @@ def _gauge(value: float, title: str, subtitle: str = "") -> go.Figure:
         )
     )
 
-def _render_panel(col_container, region_label: str):
+def _render_geo_panel(col_container, region_label: str):
+    """
+    Renderiza uma subseção para a geografia:
+    - Calcula RC ponderado pelos atores definidos para a geografia.
+    - Calcula OP final com as entradas do dia + fatores secundários do partido.
+    - Mostra um gauge 0–100 com um resumo dos componentes.
+    """
     with col_container:
-        df_day_party = relations[(relations["data"] == pd.to_datetime(date_sel)) & (relations["partido"] == partido_opt)]
-        df_geo = _filter_geo(df_day_party, region_label)
-        rc = _rc_term(df_geo)
-        op = _op_score(rc, pesquisas_val, midia_val, manif_val, econ_val, hist_val)
+        # filtra localmente por data/partido (sem tocar outros DFs)
+        df_day_party_local = relations[
+            (relations["data"] == pd.to_datetime(date_sel)) &
+            (relations["partido"] == partido_opt)
+        ].copy()
+
+        rcw = _rc_weighted_named(df_day_party_local, region_label)
+        op  = _op_score(rcw, pesquisas_val, midia_val, manif_val, econ_val, hist_val)
+
         subtitle = (
-            f"RC {rc:.1f} • Pesq {pesquisas_val:.0f} • Mídia {midia_val:.0f} • "
-            f"Manif {manif_val:.0f} • Econ {econ_val:.0f} • Hist {hist_val:.0f}"
+            f"RC (ponderado) {rcw:.1f} • Pesq {pesquisas_val:.0f} • "
+            f"Mídia {midia_val:.0f} • Manif {manif_val:.0f} • Econ {econ_val:.0f} • Hist {hist_val:.0f}"
         )
+        st.markdown(f"#### {region_label}")
         fig = _gauge(op, f"{region_label}", subtitle)
         fig.update_layout(height=260, margin=dict(l=8, r=8, t=40, b=8))
         st.plotly_chart(fig, use_container_width=True)
 
-# --- Grid 2×3 de painéis ---
+# ---------- Layout em duas colunas (6 subseções) ----------
 left_col, right_col = st.columns(2)
 
 with left_col:
-    st.markdown("#### Internacional · Continental · País VERMELHO")
-_render_panel(left_col, "INTERNACIONAL")
-_render_panel(left_col, "CONTINENTE")
-_render_panel(left_col, "PAÍS VERMELHO")
+    _render_geo_panel(left_col, "INTERNACIONAL")
+    st.divider()
+    _render_geo_panel(left_col, "CONTINENTE")
+    st.divider()
+    _render_geo_panel(left_col, "PAÍS VERMELHO")
 
 with right_col:
-    st.markdown("#### TOPÁZIO · FENO · País AZUL")
-_render_panel(right_col, "TOPÁZIO")
-_render_panel(right_col, "FENO")
-_render_panel(right_col, "PAÍS AZUL")
+    _render_geo_panel(right_col, "TOPÁZIO")
+    st.divider()
+    _render_geo_panel(right_col, "FENO")
+    st.divider()
+    _render_geo_panel(right_col, "PAÍS AZUL")
 
 # --- Nota de referência analítica (escalas) ---
 st.info(
     "**Escala:** R (boas-vontades/afinidade) e C (respeito/dissuasão), ambos em 0–100.\n\n"
-    "**Classificação subjetiva (7 níveis, por R):**\n"
+    "**Classificação subjetiva (7 níveis, por R):** "
     "0–19 **Hostilidade extrema** · 20–34 **Hostil** · 35–49 **Tenso/Desfavorável** · "
     "50–59 **Neutro** · 60–69 **Cooperativo** · 70–79 **Parceiro** · 80–100 **Aliado**.\n\n"
-    "**Classificação subjetiva (5 níveis, por C):**\n"
+    "**Classificação subjetiva (5 níveis, por C):** "
     "0–19 **Impunidade/Desdém** · 20–39 **Respeito/Temor Baixo** · 40–59 **Respeito/Temor Moderado** · "
     "60–79 **Respeito/Temor Elevado** · 80–100 **Dissuasão Dominante**."
 )
