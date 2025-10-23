@@ -278,7 +278,6 @@ else:
 
 
 
-# ======= Evolução por Ator (linhas) =======
 # ======= Evolução por ator — baseline vs atual (até 4 atores lado a lado) =======
 st.markdown("### Evolução por ator — baseline vs data atual")
 
@@ -409,24 +408,42 @@ if date_cmp is not None and pd.to_datetime(date_cmp) != pd.to_datetime(date_sel)
 else:
     st.info("Ative a comparação na barra lateral para ver as mudanças do dia.")
 
-# ======= Eventos e impactos =======
+# ======= Eventos e impactos (corrigido: filtro por dia inteiro) =======
 st.markdown("### Eventos e impactos")
-ev = events[events["data"] == pd.to_datetime(date_sel)].sort_values("data")
+
+# Garante dtype datetime, caso algo tenha vindo como string
+events = events.copy()
+events["data"] = pd.to_datetime(events["data"], errors="coerce")
+
+day_start = pd.to_datetime(date_sel).normalize()              # 2025-10-22 00:00:00
+day_end   = day_start + pd.Timedelta(days=1)                  # 2025-10-23 00:00:00
+
+# Filtra todos os eventos dentro do dia selecionado (independente da hora)
+ev = events[(events["data"] >= day_start) & (events["data"] < day_end)].sort_values("data")
+
 if ev.empty:
     st.write("Sem eventos cadastrados para a data selecionada.")
 else:
     def _fmt_event(eid: str) -> str:
         row = ev.loc[ev["event_id"] == eid].iloc[0]
-        return f"{eid} — {row['titulo']} ({pd.to_datetime(row['data']).strftime('%d/%m/%Y')})"
-    sel_event = st.selectbox("Selecione um evento", options=ev["event_id"], format_func=_fmt_event)
+        dt  = pd.to_datetime(row["data"]) if pd.notna(row["data"]) else None
+        when = dt.strftime("%d/%m/%Y %H:%M") if dt is not None else "data inválida"
+        return f"{eid} — {row.get('titulo', '')} ({when})"
+
+    sel_event = st.selectbox(
+        "Selecione um evento",
+        options=ev["event_id"].tolist(),
+        format_func=_fmt_event
+    )
 
     impacts = event_impacts[event_impacts["event_id"] == sel_event]
     impacts = impacts[impacts["partido"] == partido_opt]
     impacts = impacts.merge(actors, on="actor_id", how="left")
+
     if impacts.empty:
         st.write("Nenhum impacto registrado para o partido/atores filtrados.")
     else:
-        impacts_disp = impacts[["nome","partido","delta_R","delta_C","racional","atraso_dias"]]
+        impacts_disp = impacts[["nome", "partido", "delta_R", "delta_C", "racional", "atraso_dias"]]
         st.dataframe(impacts_disp, use_container_width=True)
 
 st.caption("Versão Excel • Barras horizontais por métrica (Baseline vs Dia, destaque laranja) • Linha de evolução por ator (R/C) • Matriz Inicial 16/10/2025.")
