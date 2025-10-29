@@ -236,7 +236,7 @@ def update_relations_for_date(
 # ===================
 if __name__ == "__main__":
     infile = "AZUVER_dashboard_data_2.xlsx"   # ajuste conforme necessário
-    data_alvo = "28/10/2025  00:00:00"
+    data_alvo = "29/10/2025  00:00:00"
     outfile = update_relations_for_date(
         infile,
         data_alvo,
