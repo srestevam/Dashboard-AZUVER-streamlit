@@ -18,7 +18,9 @@ def load_data(xlsx_path: str):
     actors = pd.read_excel(xlsx_path, sheet_name="actors")
     events = pd.read_excel(xlsx_path, sheet_name="events", parse_dates=["data"])
     event_impacts = pd.read_excel(xlsx_path, sheet_name="event_impacts")
-    return relations, actors, events, event_impacts
+    relations_daily = pd.read_excel(xlsx_path, sheet_name="relations_daily")
+
+    return relations, actors, events, event_impacts, relations_daily
 
 def ensure_merge(relations, actors):
     df = relations.merge(actors, on="actor_id", how="left")
@@ -108,8 +110,9 @@ if uploaded is not None:
         f.write(uploaded.getbuffer())
 st.session_state["xlsx_file"] = xlsx_file
 
-relations, actors, events, event_impacts = load_data(xlsx_file)
+relations, actors, events, event_impacts, relations_daily = load_data(xlsx_file)
 relations = ensure_merge(relations, actors)
+
 
 # ======= Filtros =======
 st.sidebar.header("Filtros")
@@ -155,6 +158,169 @@ with col_r:
     metric_column("R", "R (afinidade)", partido_opt, day_df, baseline_df, date_sel)
 with col_c:
     metric_column("C", "C (respeito/temor)", partido_opt, day_df, baseline_df, date_sel)
+
+# ======= fim da seção de matriz de relacionamento =======
+# ====== Valor atual do R — Linha (global) sobre Barras por Grupo (diário; por partido) ======
+import plotly.graph_objects as go
+import pandas as pd
+import unicodedata, re
+
+st.markdown("### Valor atual do R — média global diária × média diária por grupo")
+
+try:
+    _rd = relations_daily.copy()
+except NameError:
+    _rd = relations.copy()
+
+try:
+    _actors = actors.copy()
+except NameError:
+    _actors = None
+
+_rd["data"] = pd.to_datetime(_rd["data"], errors="coerce")
+_rd["partido"] = _rd["partido"].astype(str).str.upper().str.strip()
+
+partido_sel_R = st.selectbox(          # <<< variável e KEY distintos desta seção
+    "Partido",
+    options=["Ambos", "AZUL", "VERMELHO"],
+    index=0,
+    key="w_Ratual_partido_sel"         # <<< KEY ÚNICO
+)
+
+if partido_sel_R != "Ambos":
+    _rd = _rd[_rd["partido"] == partido_sel_R]
+
+if _rd.empty:
+    st.info("Não há dados de relações diárias para o filtro selecionado.")
+else:
+    GRUPOS_ORD = [
+        "1) Estatais – âmbito interno",
+        "2) Estatais – externo/intergovernamental",
+        "3) Político-sociais e comunitários",
+        "4) Populações vulneráveis",
+        "5) Ecossistema informacional e de mídia",
+        "6) Atores armados não estatais / irregulares",
+    ]
+
+    def _normkey(s: str) -> str:
+        s = str(s or "")
+        s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+        return re.sub(r"\s+", " ", s).strip().lower()
+
+    NAME_MAP_MULTI = {
+        _normkey("APAV (Assoc. de Produtores de VERMELHO)"): ["3) Político-sociais e comunitários"],
+        _normkey("ESCURO"): ["2) Estatais – externo/intergovernamental"],
+        _normkey("CSOI"): ["2) Estatais – externo/intergovernamental", "5) Ecossistema informacional e de mídia"],
+        _normkey("SOWETO VERMELHO"): ["6) Atores armados não estatais / irregulares", "3) Político-sociais e comunitários"],
+        _normkey("PCS"): ["3) Político-sociais e comunitários", "5) Ecossistema informacional e de mídia"],
+        _normkey("População AZULINA"): ["3) Político-sociais e comunitários", "4) Populações vulneráveis"],
+        _normkey("PDC"): ["3) Político-sociais e comunitários", "5) Ecossistema informacional e de mídia"],
+        _normkey("AIEA"): ["2) Estatais – externo/intergovernamental", "5) Ecossistema informacional e de mídia"],
+        _normkey("CINZA"): ["2) Estatais – externo/intergovernamental"],
+        _normkey("MARROM"): ["2) Estatais – externo/intergovernamental"],
+        _normkey("FILTO"): ["3) Político-sociais e comunitários", "5) Ecossistema informacional e de mídia"],
+        _normkey("VERMELHINOS"): ["3) Político-sociais e comunitários", "4) Populações vulneráveis"],
+        _normkey("Descendentes de CHUMBO em TOPÁZIO"): ["3) Político-sociais e comunitários", "4) Populações vulneráveis"],
+        _normkey("GELO"): ["2) Estatais – externo/intergovernamental"],
+        _normkey("ONGs no TO"): ["3) Político-sociais e comunitários", "4) Populações vulneráveis", "5) Ecossistema informacional e de mídia"],
+        _normkey("MPL"): ["6) Atores armados não estatais / irregulares", "3) Político-sociais e comunitários", "5) Ecossistema informacional e de mídia"],
+    }
+
+    id_to_name = None
+    if _actors is not None and {"actor_id", "nome"}.issubset(_actors.columns):
+        aux = _actors[["actor_id", "nome"]].dropna()
+        aux["actor_id"] = aux["actor_id"].astype(str).str.strip()
+        aux["nome"] = aux["nome"].astype(str).str.strip()
+        id_to_name = dict(zip(aux["actor_id"], aux["nome"]))
+
+    def _classify_groups_by_id(actor_id: str) -> list[str]:
+        canonical_name = id_to_name.get(str(actor_id).strip()) if (id_to_name and pd.notna(actor_id)) else None
+        if not canonical_name or str(canonical_name).strip() == "":
+            return []
+        glist = NAME_MAP_MULTI.get(_normkey(canonical_name), [])
+        return [g for g in dict.fromkeys(glist) if g in GRUPOS_ORD]
+
+    base = _rd[["data", "actor_id", "R"]].dropna(subset=["data", "actor_id", "R"]).copy()
+
+    linha_global = (
+        base.groupby("data", as_index=False)
+        .agg(R_medio_global=("R", "mean"), n=("R", "size"))
+        .sort_values("data")
+    )
+
+    base["grupos"] = base["actor_id"].apply(_classify_groups_by_id)
+    base = base[base["grupos"].map(lambda x: isinstance(x, list) and len(x) > 0)]
+    base = base.explode("grupos").rename(columns={"grupos": "grupo"})
+
+    por_grupo = (
+        base.groupby(["data", "grupo"], as_index=False)
+        .agg(R_medio=("R", "mean"), n=("R", "size"))
+    )
+
+    if linha_global.empty and por_grupo.empty:
+        st.info("Sem dados suficientes para o período/partido selecionado.")
+    else:
+        pivot_mean = por_grupo.pivot_table(index="data", columns="grupo", values="R_medio", aggfunc="mean")
+        pivot_n = por_grupo.pivot_table(index="data", columns="grupo", values="n", aggfunc="sum")
+        for g in GRUPOS_ORD:
+            if g not in pivot_mean.columns:
+                pivot_mean[g] = None
+                pivot_n[g] = 0
+        pivot_mean = pivot_mean[GRUPOS_ORD].sort_index()
+        pivot_n = pivot_n[GRUPOS_ORD].loc[pivot_mean.index]
+
+        x_dates = pivot_mean.index.to_pydatetime().tolist()
+        group_colors = {
+            "1) Estatais – âmbito interno": "#636EFA",
+            "2) Estatais – externo/intergovernamental": "#EF553B",
+            "3) Político-sociais e comunitários": "#00CC96",
+            "4) Populações vulneráveis": "#AB63FA",
+            "5) Ecossistema informacional e de mídia": "#FFA15A",
+            "6) Atores armados não estatais / irregulares": "#19D3F3",
+        }
+
+        fig = go.Figure()
+        for g in GRUPOS_ORD:
+            y_vals = pivot_mean[g].tolist()
+            n_vals = pivot_n[g].tolist()
+            fig.add_trace(go.Bar(
+                name=g, x=x_dates, y=y_vals,
+                marker_color=group_colors.get(g, None),
+                hovertemplate="<b>%{x|%d/%m/%Y}</b><br>Grupo: "+g+"<br>R médio (atual): %{y:.2f}<br>Nº de atores no grupo: %{customdata}<extra></extra>",
+                customdata=n_vals
+            ))
+
+        total_series = linha_global.set_index("data").reindex(pivot_mean.index)
+        legenda_partido = partido_sel_R if partido_sel_R != "Ambos" else "Ambos os partidos"
+        fig.add_trace(go.Scatter(
+            name=f"R médio global diário — {legenda_partido}",
+            x=x_dates,
+            y=total_series["R_medio_global"].tolist(),
+            mode="lines+markers",
+            line=dict(width=3, color="#222"),
+            hovertemplate="<b>%{x|%d/%m/%Y}</b><br>R médio global: %{y:.2f}<extra></extra>"
+        ))
+
+        fig.update_layout(
+            barmode="group",
+            xaxis_title="Data",
+            yaxis_title=f"R (valor atual) — {legenda_partido}",
+            legend_title_text="Grupos",
+            height=520,
+            margin=dict(l=10, r=10, t=40, b=10)
+        )
+        fig.update_yaxes(zeroline=True, zerolinewidth=1, range=[0, 100])
+        fig.update_xaxes(tickformat="%d/%m/%Y")
+        # >>> SUPRIMIR DIAS SEM DADOS (sem fins de semana/feriados vazios)
+        if len(pivot_mean.index) >= 2:
+            full_range = pd.date_range(pivot_mean.index.min(), pivot_mean.index.max(), freq="D")
+            missing_dates = full_range.difference(pivot_mean.index)
+            if len(missing_dates) > 0:
+                fig.update_xaxes(rangebreaks=[dict(values=missing_dates.to_pydatetime().tolist())])
+
+        st.plotly_chart(fig, use_container_width=True)
+
+# ======= fim da seção da linha do tempo ======
 
 # ======= KPIs (médias simples) =======
 st.markdown("### Indicadores do Dia")
@@ -728,3 +894,510 @@ st.info(
     "0–19 **Impunidade/Desdém** · 20–39 **Respeito/Temor Baixo** · 40–59 **Respeito/Temor Moderado** · "
     "60–79 **Respeito/Temor Elevado** · 80–100 **Dissuasão Dominante**."
 )
+
+# ===================== MORAL DAS TROPAS (usa ÚLTIMA JORNADA) =====================
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+
+st.markdown("## MORAL DAS TROPAS")
+
+st.markdown(
+"""
+**Métrica (IMOR-S 0–100)** — por partido (AZUL/VERMELHO), a partir de:  
+**Respeito (C)** + **Apoio civil (R)** − **Estressores** + **PRC** (informado).
+
+**Fórmula**  
+IMOR_P = clamp_0_100( 50 + 35Respeito_P + 35ApoioCivil_P + 20PRC_P − 20Estressores_P )
+
+**Faixas**: 0–37 = **BAIXA** · 37–66 = **NORMAL** · 67–100 = **ALTA**.
+"""
+)
+
+# ---------- Conjuntos de atores ----------
+RESPEITO_SET  = ["ESCURO","CSOI","CINZA","MARROM","FILTO","GELO","MPL","PCS"]
+APOIO_SET     = ["APAV (Assoc. de Produtores de VERMELHO)","SOWETO VERMELHO","População AZULINA",
+                 "VERMELHINOS","Descendentes de CHUMBO em TOPÁZIO","ONGs no TO","AIEA","PDC"]
+ESTRESSOR_SET = ["ESCURO","CSOI","CINZA","MARROM","FILTO","GELO","MPL"]
+
+# ---------- Helpers (sem mutar DFs globais) ----------
+def _norm_pm1(x):      # 0–100 -> –1…+1
+    return float(np.clip((float(x) - 50.0)/50.0, -1.0, 1.0)) if pd.notna(x) else 0.0
+
+def _hostilidade(arr_like):  # 0–100 -> 0…1 (quanto abaixo de 50)
+    R = np.asarray(pd.to_numeric(arr_like, errors="coerce"), dtype=float)
+    return np.clip((50.0 - R)/50.0, 0.0, 1.0)
+
+def _prc_to_pm1(prc):
+    prc = max(0.0001, float(prc))  # evita div/0
+    return float(np.clip((prc - 1.0)/(prc + 1.0), -1.0, 1.0))
+
+def _class_moral(v):
+    if v >= 67: return "ALTA"
+    if v >= 37: return "NORMAL"
+    return "BAIXA"
+
+def _detect_time_col(df: pd.DataFrame) -> str | None:
+    for c in ["jornada", "data", "timestamp", "date"]:
+        if c in df.columns:
+            return c
+    return None
+
+def _to_datetime_safe(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce", utc=True).dt.tz_convert(None)
+
+def _prepare_rel_local(relations_df: pd.DataFrame, actors_df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Cria cópia local mínima, garantindo 'actor_name' se possível.
+    """
+    _rel = relations_df.copy(deep=True)
+    cols = [c for c in ["partido","actor_id","actor_name","R","C","jornada","data","timestamp","date"] if c in _rel.columns]
+    _rel = _rel[cols].copy(deep=True)
+
+    if "actor_name" not in _rel.columns and "actor_id" in _rel.columns and actors_df is not None:
+        _act = actors_df.copy(deep=True)
+        if {"actor_id","actor_name"}.issubset(_act.columns):
+            _map = (_act.drop_duplicates("actor_id").set_index("actor_id")["actor_name"].to_dict())
+            _rel["actor_name"] = _rel["actor_id"].map(_map)
+
+    return _rel
+
+def _latest_snapshot(rel_local: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
+    """
+    Seleciona a **última jornada disponível** globalmente (mesmo dia para todos).
+    Se houver 'jornada' (numérica ou ordinal), usa o max; senão tenta data/timestamp.
+    Retorna (df_filtrado, nome_col_tempo, valor_ultimo).
+    """
+    time_col = _detect_time_col(rel_local)
+    if not time_col:
+        # Sem coluna temporal: devolve como está (deve ser um snapshot único)
+        return rel_local, "(sem coluna temporal)", "(snapshot único)"
+
+    # normaliza só para escolha, sem modificar o original
+    _tmp = rel_local[[time_col]].copy()
+    if time_col == "jornada":
+        # Mantém como está; tenta converter a numérico para garantir max correto
+        _last_val = pd.to_numeric(_tmp[time_col], errors="coerce").max()
+        df_last = rel_local[pd.to_numeric(rel_local[time_col], errors="coerce") == _last_val].copy(deep=True)
+        return df_last, "jornada", str(_last_val)
+    else:
+        # data/timestamp/date
+        _last_dt = _to_datetime_safe(_tmp[time_col]).max()
+        df_last = rel_local[_to_datetime_safe(rel_local[time_col]) == _last_dt].copy(deep=True)
+        return df_last, time_col, (_last_dt.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(_last_dt) else "inválido")
+
+def calc_imor_s(rel_df_local: pd.DataFrame, partido: str, prc_value: float) -> tuple[float, dict]:
+    base = rel_df_local.loc[rel_df_local["partido"] == partido].copy(deep=True)
+
+    c_slice = base.loc[base.get("actor_name").isin(RESPEITO_SET) if "actor_name" in base.columns else [], "C"].dropna()
+    respeito = _norm_pm1(c_slice.mean()) if not c_slice.empty else 0.0
+
+    r_slice = base.loc[base.get("actor_name").isin(APOIO_SET) if "actor_name" in base.columns else [], "R"].dropna()
+    apoio = _norm_pm1(r_slice.mean()) if not r_slice.empty else 0.0
+
+    e_slice = base.loc[base.get("actor_name").isin(ESTRESSOR_SET) if "actor_name" in base.columns else [], "R"].dropna()
+    estressores = float(_hostilidade(e_slice).mean()) if not e_slice.empty else 0.0  # 0..1
+
+    prc = _prc_to_pm1(prc_value)
+
+    imor = float(np.clip(50 + 35*respeito + 35*apoio + 20*prc - 20*estressores, 0, 100))
+    comps = {
+        "Respeito": respeito,
+        "Apoio civil": apoio,
+        "PRC (–1..+1)": prc,
+        "Estressores (0..1)": estressores
+    }
+    return imor, comps
+
+# ---------- PRC em sessão (independente de filtros) ----------
+if "prc_AZUL" not in st.session_state: st.session_state["prc_AZUL"] = 1.0
+if "prc_VERMELHO" not in st.session_state: st.session_state["prc_VERMELHO"] = 1.0
+
+c1, c2 = st.columns(2)
+with c1:
+    st.number_input("PRC — AZUL (poder AZUL / poder VERMELHO)", min_value=0.05, max_value=20.0, step=0.05, key="prc_AZUL")
+with c2:
+    st.number_input("PRC — VERMELHO (poder VERMELHO / poder AZUL)", min_value=0.05, max_value=20.0, step=0.05, key="prc_VERMELHO")
+
+# ---------- Preparação LOCAL + última jornada (NÃO altera DFs globais) ----------
+_relations_src = relations.copy(deep=True)
+_actors_src = actors.copy(deep=True) if "actors" in globals() else None
+_rel_local = _prepare_rel_local(_relations_src, _actors_src)
+_rel_latest, _time_col, _last_val = _latest_snapshot(_rel_local)
+
+st.caption(f"Snapshot usado na moral: **última {_time_col} = {_last_val}**.")
+
+# ---------- Cálculo ----------
+imor_azul, comps_azul = calc_imor_s(_rel_latest, "AZUL",     st.session_state["prc_AZUL"])
+imor_verm, comps_verm = calc_imor_s(_rel_latest, "VERMELHO", st.session_state["prc_VERMELHO"])
+
+# ---------- Gráfico ----------
+fig = go.Figure()
+fig.add_shape(type="rect", x0=0,  x1=37, y0=-0.5, y1=1.5, fillcolor="#ef4444", opacity=0.15, layer="below", line_width=0)
+fig.add_shape(type="rect", x0=37, x1=66, y0=-0.5, y1=1.5, fillcolor="#f59e0b", opacity=0.15, layer="below", line_width=0)
+fig.add_shape(type="rect", x0=67, x1=100,y0=-0.5, y1=1.5, fillcolor="#10b981", opacity=0.15, layer="below", line_width=0)
+
+fig.add_trace(go.Bar(
+    y=["AZUL", "VERMELHO"],
+    x=[imor_azul, imor_verm],
+    orientation="h",
+    text=[f"{imor_azul:.1f} ({_class_moral(imor_azul)})", f"{imor_verm:.1f} ({_class_moral(imor_verm)})"],
+    textposition="outside",
+    hovertemplate="<b>%{y}</b><br>IMOR: %{x:.1f}<extra></extra>"
+))
+fig.add_vline(x=37, line_dash="dot", line_color="#666", opacity=0.8)
+fig.add_vline(x=66, line_dash="dot", line_color="#666", opacity=0.8)
+fig.update_layout(
+    height=320, margin=dict(l=80, r=20, t=10, b=30),
+    xaxis=dict(range=[0,100], title="Índice de Moral (0–100)"),
+    yaxis=dict(autorange="reversed"), showlegend=False
+)
+st.plotly_chart(fig, use_container_width=True)
+
+# ---------- Componentes ----------
+with st.expander("Ver componentes e notas metodológicas"):
+    colA, colB = st.columns(2)
+    with colA:
+        st.write("**AZUL — componentes (–1…+1 | estressores 0…1)**")
+        st.json(comps_azul)
+    with colB:
+        st.write("**VERMELHO — componentes (–1…+1 | estressores 0…1)**")
+        st.json(comps_verm)
+    st.markdown(
+        """
+        **Atores usados**  
+        • Respeito: ESCURO, CSOI, CINZA, MARROM, FILTO, GELO, MPL, PCS  
+        • Apoio civil: APAV, SOWETO VERMELHO, População AZULINA, VERMELHINOS, Descendentes de CHUMBO em TOPÁZIO, ONGs no TO, AIEA, PDC  
+        • Estressores: ESCURO, CSOI, CINZA, MARROM, FILTO, GELO, MPL
+
+        *Observação*: PRCs vivem em `st.session_state` e **não** sofrem com filtros do dashboard.
+        """
+    )
+# =================== FIM / MORAL DAS TROPAS ===================
+# ======= Evolução diária do R — Ator × Média do Partido =======
+import plotly.graph_objects as go
+
+st.markdown("### Evolução diária do R — Ator × Média do Partido")
+
+# Trabalhar em cópia local para não alterar DFs usados em outras seções
+_rel_local = relations.copy()
+_rel_local["data"] = pd.to_datetime(_rel_local["data"], errors="coerce")
+
+# Lista de atores do partido atual
+_opts_df = _rel_local[_rel_local["partido"] == partido_opt].dropna(subset=["nome"])
+actor_options = sorted(_opts_df["nome"].unique().tolist())
+
+if not actor_options:
+    st.info("Não há atores disponíveis para este partido.")
+else:
+    actor_sel = st.selectbox(
+        "Selecione o ator",
+        options=actor_options,
+        index=0
+    )
+
+    # Série diária do R do ator selecionado (agregação por segurança: média se houver duplicidade)
+    actor_daily = (
+        _opts_df[_opts_df["nome"] == actor_sel]
+        .groupby("data", as_index=False)
+        .agg(R_ator=("R", "mean"))
+        .sort_values("data")
+    )
+
+    # Série diária da média de R do partido
+    party_daily = (
+        _opts_df.groupby("data", as_index=False)
+        .agg(R_medio_partido=("R", "mean"))
+        .sort_values("data")
+    )
+
+    # Garante o mesmo eixo X (união de datas)
+    all_days = pd.DataFrame({"data": sorted(set(actor_daily["data"]).union(set(party_daily["data"])))})
+    plot_df = (
+        all_days
+        .merge(actor_daily, on="data", how="left")
+        .merge(party_daily, on="data", how="left")
+        .sort_values("data")
+    )
+
+    if plot_df.empty or plot_df["data"].isna().all():
+        st.info("Sem dados suficientes para plotar a evolução diária.")
+    else:
+        base, base_light, hl = base_colors(partido_opt)
+
+        fig = go.Figure()
+
+        # Barras: R diário do ator
+        fig.add_bar(
+            x=plot_df["data"],
+            y=plot_df["R_ator"],
+            name=f"R do ator — {actor_sel}",
+            marker_color=base_light
+        )
+
+        # Linha: média diária de R do partido
+        fig.add_trace(
+            go.Scatter(
+                x=plot_df["data"],
+                y=plot_df["R_medio_partido"],
+                name=f"Média de R — {partido_opt}",
+                mode="lines+markers",
+                line=dict(width=3, color=base)
+            )
+        )
+
+        fig.update_layout(
+            xaxis_title="Data",
+            yaxis_title="R (0–100)",
+            height=460,
+            margin=dict(l=10, r=10, t=40, b=10),
+            legend_title_text="Séries"
+        )
+        # Escala fixa 0–100 para facilitar leitura
+        fig.update_yaxes(range=[0, 100])
+        # Formatação amigável da data no hover
+        fig.update_xaxes(tickformat="%d/%m/%Y")
+        # >>> SUPRIMIR DIAS SEM DADOS (sem fins de semana/feriados vazios)
+        if len(pivot_mean.index) >= 2:
+            full_range = pd.date_range(pivot_mean.index.min(), pivot_mean.index.max(), freq="D")
+            missing_dates = full_range.difference(pivot_mean.index)
+            if len(missing_dates) > 0:
+                fig.update_xaxes(rangebreaks=[dict(values=missing_dates.to_pydatetime().tolist())])
+
+        st.plotly_chart(fig, use_container_width=True)
+
+# ========== ΔR médio diário — Linha (total) sobre Barras lado a lado por Grupo (filtro por CRI; grupos não exclusivos; com partido) ==========
+import plotly.graph_objects as go
+import pandas as pd
+import unicodedata, re
+
+st.markdown("### ΔR médio diário — filtro por CRI e Partido (linha total sobre barras por grupo; grupos não exclusivos)")
+
+# --- Pré-requisitos: DFs 'events', 'event_impacts' (e opcionalmente 'actors') já carregados no app ---
+_ev = events.copy()
+_imp = event_impacts.copy()
+try:
+    _actors = actors.copy()
+except NameError:
+    _actors = None
+
+# Normalizações defensivas
+for col in ["event_id", "data", "CRI_lista"]:
+    if col not in _ev.columns:
+        _ev[col] = ""
+_ev["CRI_lista"] = _ev["CRI_lista"].fillna("")
+_ev["data"] = pd.to_datetime(_ev["data"], errors="coerce")
+
+# ======= UI: filtros =======
+CRI_OPCOES = [
+    "Operações Psicológicas (Op Psc)",
+    "Guerra Eletrônica (GE)",
+    "Defesa Cibernética",
+    "Comunicação Social (Com Soc)",
+    "Assuntos Civis (Ass Civ)",
+]
+colf1, colf2 = st.columns([3, 1])
+with colf1:
+    cri_sel_delta = st.multiselect(
+        "Selecione uma ou mais CRI",
+        options=CRI_OPCOES,
+        default=[],
+        key="w_deltaR_cri_ms"  # <<< KEY ÚNICO
+    )
+with colf2:
+    partido_sel_delta = st.selectbox(
+        "Partido",
+        options=["Ambos", "AZUL", "VERMELHO"],
+        index=0,
+        key="w_deltaR_partido_sel"  # <<< KEY ÚNICO
+    )
+
+if not cri_sel_delta:
+    st.info("Selecione pelo menos uma CRI para aplicar o filtro.")
+else:
+    # Explode CRI por evento (CRI separadas por ';')
+    _ev_cri = (
+        _ev[["event_id", "data", "CRI_lista"]]
+        .assign(CRI=_ev["CRI_lista"].astype(str).str.split(";"))
+        .explode("CRI")
+    )
+    _ev_cri["CRI"] = _ev_cri["CRI"].fillna("").str.strip()
+    cri_sel_set = {c.strip().lower() for c in cri_sel_delta}
+
+    # Eventos que possuem ao menos UMA CRI selecionada
+    ev_ok = (
+        _ev_cri[_ev_cri["CRI"].str.lower().isin(cri_sel_set)]
+        [["event_id", "data"]]
+        .drop_duplicates()
+    )
+
+    if ev_ok.empty:
+        st.warning("Nenhum evento encontrado com as CRI selecionadas.")
+    else:
+        GRUPOS_ORD = [
+            "1) Estatais – âmbito interno",
+            "2) Estatais – externo/intergovernamental",
+            "3) Político-sociais e comunitários",
+            "4) Populações vulneráveis",
+            "5) Ecossistema informacional e de mídia",
+            "6) Atores armados não estatais / irregulares",
+        ]
+
+        def _normkey(s: str) -> str:
+            s = str(s or "")
+            s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+            return re.sub(r"\s+", " ", s).strip().lower()
+
+        NAME_MAP_MULTI = {
+            _normkey("APAV (Assoc. de Produtores de VERMELHO)"): ["3) Político-sociais e comunitários"],
+            _normkey("ESCURO"): ["2) Estatais – externo/intergovernamental"],
+            _normkey("CSOI"): ["2) Estatais – externo/intergovernamental", "5) Ecossistema informacional e de mídia"],
+            _normkey("SOWETO VERMELHO"): ["6) Atores armados não estatais / irregulares", "3) Político-sociais e comunitários"],
+            _normkey("PCS"): ["3) Político-sociais e comunitários", "5) Ecossistema informacional e de mídia"],
+            _normkey("População AZULINA"): ["3) Político-sociais e comunitários", "4) Populações vulneráveis"],
+            _normkey("PDC"): ["3) Político-sociais e comunitários", "5) Ecossistema informacional e de mídia"],
+            _normkey("AIEA"): ["2) Estatais – externo/intergovernamental", "5) Ecossistema informacional e de mídia"],
+            _normkey("CINZA"): ["2) Estatais – externo/intergovernamental"],
+            _normkey("MARROM"): ["2) Estatais – externo/intergovernamental"],
+            _normkey("FILTO"): ["3) Político-sociais e comunitários", "5) Ecossistema informacional e de mídia"],
+            _normkey("VERMELHINOS"): ["3) Político-sociais e comunitários", "4) Populações vulneráveis"],
+            _normkey("Descendentes de CHUMBO em TOPÁZIO"): ["3) Político-sociais e comunitários", "4) Populações vulneráveis"],
+            _normkey("GELO"): ["2) Estatais – externo/intergovernamental"],
+            _normkey("ONGs no TO"): ["3) Político-sociais e comunitários", "4) Populações vulneráveis", "5) Ecossistema informacional e de mídia"],
+            _normkey("MPL"): ["6) Atores armados não estatais / irregulares", "3) Político-sociais e comunitários", "5) Ecossistema informacional e de mídia"],
+        }
+
+        id_to_name = None
+        try:
+            if _actors is not None and {"actor_id","nome"}.issubset(_actors.columns):
+                aux = _actors[["actor_id","nome"]].dropna()
+                aux["actor_id"] = aux["actor_id"].astype(str).str.strip()
+                aux["nome"] = aux["nome"].astype(str).str.strip()
+                id_to_name = dict(zip(aux["actor_id"], aux["nome"]))
+        except Exception:
+            id_to_name = None
+
+        KW_RULES_MULTI = [
+            (r'(paramilitar|mil[ií]cia|grupo armado|irregular|guerrilha|bra[cç]o militar|mpl)\b',
+             ["6) Atores armados não estatais / irregulares"]),
+            (r'\b(conselho|organismo|organiza[cç][aã]o|ag[eê]ncia)\s+(internacional|intergovernamental)\b',
+             ["2) Estatais – externo/intergovernamental"]),
+            (r'\b(pa[ií]s|estado)\b', ["2) Estatais – externo/intergovernamental"]),
+            (r'\b(partido|federa[cç][aã]o|associa[cç][aã]o|sindicato|ong)\b',
+             ["3) Político-sociais e comunitários"]),
+            (r'(refugiad|deslocad|ferid|idos|crian[cç]a|gestant|vulner[aá]v|desabrig|fam[ií]lia)\b',
+             ["4) Populações vulneráveis"]),
+            (r'\bpopula[cç][aã]o\b', ["3) Político-sociais e comunitários"]),
+        ]
+
+        def _classify_groups(actor_id: str, actor_name: str) -> list[str]:
+            canonical_name = None
+            if id_to_name and pd.notna(actor_id):
+                canonical_name = id_to_name.get(str(actor_id).strip())
+            if not canonical_name or str(canonical_name).strip() == "":
+                canonical_name = str(actor_name or "").strip()
+            nk = _normkey(canonical_name)
+            groups = NAME_MAP_MULTI.get(nk, []).copy()
+            if not groups:
+                for pat, glist in KW_RULES_MULTI:
+                    if re.search(pat, nk):
+                        groups.extend(glist)
+            return [g for g in dict.fromkeys(groups) if g in GRUPOS_ORD]
+
+        # ======= Filtra impacts pelos eventos qualificados E PELO PARTIDO =======
+        _imp["partido"] = _imp["partido"].astype(str).str.upper().str.strip()
+        imp_ok = _imp[_imp["event_id"].isin(ev_ok["event_id"])].copy()
+        if partido_sel_delta != "Ambos":
+            imp_ok = imp_ok[imp_ok["partido"] == partido_sel_delta]
+
+        if imp_ok.empty:
+            st.warning("Não há impactos correspondentes aos filtros aplicados.")
+        else:
+            imp_ok = imp_ok.merge(ev_ok, on="event_id", how="left", validate="many_to_one")
+            imp_ok["data_dia"] = pd.to_datetime(imp_ok["data"], errors="coerce").dt.floor("D")
+            imp_ok["grupos"] = imp_ok.apply(lambda r: _classify_groups(r.get("actor_id"), r.get("actor_name")), axis=1)
+
+            total_diario = (
+                imp_ok.groupby("data_dia", as_index=False)
+                .agg(delta_R_medio_total=("delta_R", "mean"),
+                     n_total=("delta_R", "size"))
+                .sort_values("data_dia")
+            )
+
+            imp_exploded = imp_ok.explode("grupos")
+            imp_exploded = imp_exploded[imp_exploded["grupos"].notna()].copy()
+            imp_exploded.rename(columns={"grupos": "grupo"}, inplace=True)
+
+            por_grupo = (
+                imp_exploded
+                .groupby(["data_dia", "grupo"], as_index=False)
+                .agg(delta_R_medio=("delta_R", "mean"),
+                     n=("delta_R", "size"))
+            )
+
+            all_days = pd.DataFrame({"data_dia": sorted(imp_ok["data_dia"].dropna().unique())})
+            grupos_df = pd.DataFrame({"grupo": GRUPOS_ORD})
+            grade = all_days.assign(key=1).merge(grupos_df.assign(key=1), on="key", how="left").drop(columns="key")
+            barras_full = grade.merge(por_grupo, on=["data_dia", "grupo"], how="left")
+            barras_full["delta_R_medio"] = barras_full["delta_R_medio"].fillna(0.0)
+            barras_full["n"] = barras_full["n"].fillna(0).astype(int)
+
+            pivot_mean = barras_full.pivot_table(index="data_dia", columns="grupo", values="delta_R_medio", aggfunc="mean")
+            pivot_n = barras_full.pivot_table(index="data_dia", columns="grupo", values="n", aggfunc="sum")
+            for g in GRUPOS_ORD:
+                if g not in pivot_mean.columns:
+                    pivot_mean[g] = 0.0
+                    pivot_n[g] = 0
+            pivot_mean = pivot_mean[GRUPOS_ORD].sort_index()
+            pivot_n = pivot_n[GRUPOS_ORD].loc[pivot_mean.index]
+
+            x_dates = pivot_mean.index.to_pydatetime().tolist()
+            group_colors = {
+                "1) Estatais – âmbito interno": "#636EFA",
+                "2) Estatais – externo/intergovernamental": "#EF553B",
+                "3) Político-sociais e comunitários": "#00CC96",
+                "4) Populações vulneráveis": "#AB63FA",
+                "5) Ecossistema informacional e de mídia": "#FFA15A",
+                "6) Atores armados não estatais / irregulares": "#19D3F3",
+            }
+
+            fig = go.Figure()
+            for g in GRUPOS_ORD:
+                y_vals = pivot_mean[g].tolist()
+                n_vals = pivot_n[g].tolist()
+                fig.add_trace(go.Bar(
+                    name=g, x=x_dates, y=y_vals,
+                    marker_color=group_colors.get(g, None),
+                    hovertemplate="<b>%{x|%d/%m/%Y}</b><br>Grupo: "+g+"<br>ΔR médio: %{y:.2f}<br>Nº de variações: %{customdata}<extra></extra>",
+                    customdata=n_vals
+                ))
+
+            total_series = total_diario.set_index("data_dia").reindex(pivot_mean.index)
+            legenda_partido = partido_sel_delta if partido_sel_delta != "Ambos" else "Ambos os partidos"
+            fig.add_trace(go.Scatter(
+                name=f"ΔR médio diário (total filtrado — {legenda_partido})",
+                x=x_dates,
+                y=total_series["delta_R_medio_total"].tolist(),
+                mode="lines+markers",
+                line=dict(width=3, color="#222"),
+                hovertemplate="<b>%{x|%d/%m/%Y}</b><br>ΔR médio (total): %{y:.2f}<extra></extra>"
+            ))
+
+            fig.update_layout(
+                barmode="group",
+                xaxis_title="Data",
+                yaxis_title=f"ΔR médio (filtrado por CRI; partido: {legenda_partido})",
+                legend_title_text="Grupos",
+                height=520,
+                margin=dict(l=10, r=10, t=40, b=10)
+            )
+            fig.update_yaxes(zeroline=True, zerolinewidth=1)
+            fig.update_xaxes(tickformat="%d/%m/%Y")
+            # >>> SUPRIMIR DIAS SEM DADOS (sem fins de semana/feriados vazios)
+            if len(pivot_mean.index) >= 2:
+                full_range = pd.date_range(pivot_mean.index.min(), pivot_mean.index.max(), freq="D")
+                missing_dates = full_range.difference(pivot_mean.index)
+                if len(missing_dates) > 0:
+                    fig.update_xaxes(rangebreaks=[dict(values=missing_dates.to_pydatetime().tolist())])
+
+            st.plotly_chart(fig, use_container_width=True)
